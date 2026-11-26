@@ -1,0 +1,10 @@
+source,mode,lost_by_baseline,recovered,recovery_frac
+lsm,sqpoll,9,6,0.6666666666666666
+lsm,syscall,3,0,0.0
+lsm,uring,9,6,0.6666666666666666
+uring_tp,sqpoll,9,0,0.0
+uring_tp,syscall,3,0,0.0
+uring_tp,uring,9,0,0.0
+block,sqpoll,9,0,0.0
+block,syscall,3,0,0.0
+block,uring,9,0,0.0

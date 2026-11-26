@@ -284,39 +284,174 @@ def bars_for_metric(long, metric, layers, modes, ops, runs, path):
     return True
 
 
+# ---------------------------------------------------------- flood -----------
+def flood_figure(flood_csv, path):
+    """Two panels vs flood rate: (left) needle detection probability per monitor,
+    (right) the monitor's event-drop %. Reads run_flood.sh's flood_raw.csv
+    (per-rep), so points carry min-max spread across reps. This is the evasion
+    curve: as the io_uring flood intensifies, the monitor's buffer saturates and
+    a real access is seen less and less often."""
+    df = pd.read_csv(flood_csv)
+    need = {"monitor", "threads", "flood_rate", "drop_pct", "needle_frac"}
+    missing = need - set(df.columns)
+    if missing:
+        print(f"skip flood plot: {flood_csv} missing {missing}", file=sys.stderr)
+        return
+    g = (df.groupby(["monitor", "threads"])
+           .agg(rate=("flood_rate", "median"),
+                detect=("needle_frac", "mean"),
+                dlo=("needle_frac", "min"), dhi=("needle_frac", "max"),
+                drop=("drop_pct", "median")).reset_index())
+
+    monitors = [m for m in ("syscall", "lsm", "uring_tp", "block") if m in set(g.monitor)]
+    fig, (axA, axB) = plt.subplots(1, 2, figsize=(12.4, 4.6))
+    for ax in (axA, axB):
+        style_axes(ax); ax.set_axisbelow(True)
+        ax.yaxis.grid(True, color=GRID, linewidth=0.8)
+
+    for m in monitors:
+        sub = g[g.monitor == m].sort_values("rate")
+        c = LAYER_COLORS.get(m, "#888888")
+        name = LAYERS.get(m, m)
+        x = sub["rate"].to_numpy()
+        axA.fill_between(x, sub["dlo"], sub["dhi"], color=c, alpha=0.15, linewidth=0)
+        axA.plot(x, sub["detect"], "-o", color=c, linewidth=2, markersize=5,
+                 markeredgecolor="white", markeredgewidth=1, label=name)
+        axB.plot(x, sub["drop"], "-o", color=c, linewidth=2, markersize=5,
+                 markeredgecolor="white", markeredgewidth=1, label=name)
+
+    axA.set_ylim(0, 1.05)
+    axA.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
+    axA.set_ylabel("Needle detection (seen / fired)", fontsize=9.5, color=INK2)
+    axA.set_title("A real access is seen less as the flood grows", fontsize=11,
+                  color=INK, fontweight="bold")
+    axB.set_ylim(0, 100)
+    axB.set_ylabel("Monitor event-drop %", fontsize=9.5, color=INK2)
+    axB.set_title("Monitor ring-buffer loss under flood", fontsize=11,
+                  color=INK, fontweight="bold")
+    for ax in (axA, axB):
+        ax.set_xlabel("flood rate (ops/s)", fontsize=9.5, color=INK2)
+        ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(
+            lambda v, _: f"{v/1e6:.1f}M" if v >= 1e6 else (f"{v/1e3:.0f}k" if v else "0")))
+
+    handles = [plt.Line2D([], [], marker="o", color=LAYER_COLORS.get(m, "#888"),
+                          markeredgecolor="white", linewidth=2) for m in monitors]
+    fig.legend(handles, [LAYERS.get(m, m) for m in monitors], loc="upper left",
+               ncol=len(monitors), frameon=False, fontsize=9, bbox_to_anchor=(0.01, 0.98))
+    fig.suptitle("Flood-evasion: saturating a monitor's ring buffer hides a real access",
+                 fontsize=13, color=INK, x=0.01, ha="left", y=0.995)
+    fig.text(0.01, 0.01, "Line = mean over reps; band = min-max. threads=0 (rate 0) is the "
+             "no-flood control. A syscall monitor sits at 0 throughout: io_uring is invisible "
+             "to it with or without a flood.", fontsize=8, color=INK2, ha="left", va="bottom")
+    fig.tight_layout(rect=(0, 0.04, 1, 0.92))
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------- cost ------------
+def cost_figure(cost_csv, path):
+    """Two panels for the PRIMARY (buffered) scenario: (left) throughput overhead
+    % vs the no-monitor baseline, (right) events dropped per run — grouped bars,
+    x = delivery mode, one bar per attached monitor. Overhead is concentrated
+    where a monitor actually fires; drops show ring-buffer loss under load."""
+    df = pd.read_csv(cost_csv)
+    need = {"scenario", "mode", "condition", "throughput", "drops"}
+    if need - set(df.columns):
+        print(f"skip cost plot: {cost_csv} missing {need - set(df.columns)}", file=sys.stderr)
+        return
+    agg = (df.groupby(["scenario", "mode", "condition"])
+             .agg(tput=("throughput", "median"), drops=("drops", "median")).reset_index())
+    base = agg[agg.condition == "none"].set_index(["scenario", "mode"])["tput"].rename("base")
+    agg = agg.join(base, on=["scenario", "mode"])
+    agg["overhead"] = (1 - agg["tput"] / agg["base"]) * 100
+
+    sub = agg[(agg.scenario == "primary") & (agg.condition != "none")]
+    if sub.empty:
+        print("skip cost plot: no primary-scenario rows", file=sys.stderr); return
+    modes = [m for m in ("syscall", "uring", "sqpoll") if m in set(sub["mode"])]
+    conds = [c for c in ("syscall", "lsm", "uring_tp", "block") if c in set(sub.condition)]
+
+    def cell(m, cond, col):
+        v = sub[(sub["mode"] == m) & (sub.condition == cond)][col]
+        return float(v.mean()) if len(v) else 0.0
+
+    fig, (axA, axB) = plt.subplots(1, 2, figsize=(12.4, 4.6))
+    for ax in (axA, axB):
+        style_axes(ax); ax.set_axisbelow(True)
+        ax.yaxis.grid(True, color=GRID, linewidth=0.8)
+    group_w = 0.8; bar_w = group_w / max(len(conds), 1)
+    for k, cond in enumerate(conds):
+        xs = np.arange(len(modes)) - group_w / 2 + bar_w * (k + 0.5)
+        c = LAYER_COLORS.get(cond, "#888888")
+        axA.bar(xs, [cell(m, cond, "overhead") for m in modes], width=bar_w - 0.03,
+                color=c, edgecolor="white", linewidth=1, label=LAYERS.get(cond, cond))
+        axB.bar(xs, [cell(m, cond, "drops") for m in modes], width=bar_w - 0.03,
+                color=c, edgecolor="white", linewidth=1, label=LAYERS.get(cond, cond))
+    for ax in (axA, axB):
+        ax.set_xticks(range(len(modes)))
+        ax.set_xticklabels([MODES.get(m, m) for m in modes], fontsize=9.5, color=INK)
+    axA.axhline(0, color=INK2, linewidth=0.8)
+    axA.set_ylabel("Throughput overhead vs no monitor (%)", fontsize=9.5, color=INK2)
+    axA.set_title("Cost is paid where the monitor fires", fontsize=11, color=INK, fontweight="bold")
+    axB.set_ylabel("Events dropped per run", fontsize=9.5, color=INK2)
+    axB.set_title("Ring-buffer loss under load", fontsize=11, color=INK, fontweight="bold")
+
+    handles = [plt.Rectangle((0, 0), 1, 1, color=LAYER_COLORS.get(c, "#888")) for c in conds]
+    fig.legend(handles, [LAYERS.get(c, c) for c in conds], loc="upper left", ncol=len(conds),
+               frameon=False, fontsize=9, bbox_to_anchor=(0.01, 0.98))
+    fig.suptitle("Cost of monitoring: buffered I/O, by delivery mode and monitor",
+                 fontsize=13, color=INK, x=0.01, ha="left", y=0.995)
+    fig.text(0.01, 0.01, "Bars = median over reps. Overhead is ~0 where a monitor does not fire for "
+             "that mode (e.g. the syscall monitor under io_uring); that is also why it drops nothing there.",
+             fontsize=8, color=INK2, ha="left", va="bottom")
+    fig.tight_layout(rect=(0, 0.04, 1, 0.92))
+    fig.savefig(path, dpi=200); plt.close(fig)
+
+
 # ---------------------------------------------------------- main ------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("runs", nargs="+", help="run folders / per_op.csv files / globs, optionally label=path")
+    ap.add_argument("runs", nargs="*", help="detection run folders / per_op.csv files / globs, optionally label=path")
     ap.add_argument("--outdir", default="figures")
     ap.add_argument("--ops", help="comma-separated op order, e.g. open,read,write,append")
+    ap.add_argument("--flood", help="run_flood.sh's flood_raw.csv — adds the flood-evasion figure")
+    ap.add_argument("--cost", help="run_cost.sh's cost_raw.csv — adds the cost/overhead figure")
     args = ap.parse_args()
 
-    runs = resolve_runs(args.runs)
-    long = load_long(runs)
+    if not args.runs and not args.flood and not args.cost:
+        sys.exit("pass detection run folders and/or --flood <flood_raw.csv> and/or --cost <cost_raw.csv>")
     os.makedirs(args.outdir, exist_ok=True)
 
-    layers = ordered(long.layer, list(LAYERS))
-    modes = ordered(long["mode"], list(MODES))
-    ops = args.ops.split(",") if args.ops else ordered(long.op, ["open", "read", "write", "append"])
-    metrics = [m for m in METRICS if m in set(long.metric)]
+    if args.runs:
+        runs = resolve_runs(args.runs)
+        long = load_long(runs)
+        layers = ordered(long.layer, list(LAYERS))
+        modes = ordered(long["mode"], list(MODES))
+        ops = args.ops.split(",") if args.ops else ordered(long.op, ["open", "read", "write", "append"])
+        metrics = [m for m in METRICS if m in set(long.metric)]
+        print(f"runs ({len(runs)}): " + ", ".join(f"{n} [{c}]" for n, c in runs))
+        print(f"layers: {layers}\npaths:  {modes}\nops:    {ops}\nmetrics: {metrics}")
 
-    print(f"runs ({len(runs)}): " + ", ".join(f"{n} [{c}]" for n, c in runs))
-    print(f"layers: {layers}\npaths:  {modes}\nops:    {ops}\nmetrics: {metrics}")
+        table = (long.groupby(["run", "layer", "mode", "op", "metric"])["hit"]
+                     .agg(seen="sum", attempted="count").reset_index())
+        table["rate"] = table.seen / table.attempted
+        table.to_csv(os.path.join(args.outdir, "combined_long.csv"), index=False)
 
-    # the numbers behind every figure, for tables in the write-up
-    table = (long.groupby(["run", "layer", "mode", "op", "metric"])["hit"]
-                 .agg(seen="sum", attempted="count").reset_index())
-    table["rate"] = table.seen / table.attempted
-    table.to_csv(os.path.join(args.outdir, "combined_long.csv"), index=False)
+        heatmap_grid(long, layers, modes, ops, metrics, len(runs),
+                     os.path.join(args.outdir, "heatmap_all_runs.png"))
+        for m in metrics:
+            bars_for_metric(long, m, layers, modes, ops, runs,
+                            os.path.join(args.outdir, f"bars_{m}.png"))
+        print(f"wrote heatmap_all_runs.png, bars_<metric>.png, combined_long.csv to {args.outdir}/")
 
-    heatmap_grid(long, layers, modes, ops, metrics, len(runs),
-                 os.path.join(args.outdir, "heatmap_all_runs.png"))
-    for m in metrics:
-        bars_for_metric(long, m, layers, modes, ops, runs,
-                        os.path.join(args.outdir, f"bars_{m}.png"))
-    print(f"wrote heatmap_all_runs.png, bars_<metric>.png, combined_long.csv to {args.outdir}/")
+    if args.flood:
+        flood_figure(args.flood, os.path.join(args.outdir, "flood_evasion.png"))
+        print(f"wrote flood_evasion.png to {args.outdir}/")
+
+    if args.cost:
+        cost_figure(args.cost, os.path.join(args.outdir, "cost_overhead.png"))
+        print(f"wrote cost_overhead.png to {args.outdir}/")
 
 
 if __name__ == "__main__":

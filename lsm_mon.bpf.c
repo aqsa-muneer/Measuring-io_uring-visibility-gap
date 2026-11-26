@@ -16,7 +16,7 @@ char LICENSE[] SEC("license") = "GPL";
  * signature is: int file_permission(struct file *file, int mask).
  * Returning 0 = "allow" — we only observe, never block.
  */
-SEC("lsm/file_permission")
+SEC("fentry/security_file_permission")
 int BPF_PROG(on_file_perm, struct file *file, int mask) {
     char path[MAX_PATH_LEN] = {};
 
@@ -31,9 +31,9 @@ int BPF_PROG(on_file_perm, struct file *file, int mask) {
     if (mask & MAY_WRITE) {
         /* append vs overwrite: read the open flags off the file */
         unsigned int fl = BPF_CORE_READ(file, f_flags);
-        op = (fl & O_APPEND) ? OP_APPEND : OP_WRITE;
+        op = (fl & O_APPEND) ? EVT_APPEND : EVT_WRITE;
     } else if (mask & MAY_READ) {
-        op = OP_READ;
+        op = EVT_READ;
     } else {
         return 0;                 /* exec/other — not an op we score */
     }

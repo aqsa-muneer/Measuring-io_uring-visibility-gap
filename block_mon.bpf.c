@@ -31,13 +31,13 @@
 char LICENSE[] SEC("license") = "GPL";
 
 SEC("tp/block/block_rq_issue")
-int on_block_issue(struct trace_event_raw_block_rq_issue *ctx) {
+int on_block_issue(struct trace_event_raw_block_rq *ctx) {
     /* rwbs is a short text flag field: 'R'ead, 'W'rite, 'F'lush, 'D'iscard */
     char c = ctx->rwbs[0];
 
     int op;
-    if (c == 'R')      op = OP_READ;
-    else if (c == 'W') op = OP_WRITE;   /* append indistinguishable here */
+    if (c == 'R')      op = EVT_READ;
+    else if (c == 'W') op = EVT_WRITE;   /* append indistinguishable here */
     else               return 0;        /* flush/discard/etc — ignore */
 
     char nopath[MAX_PATH_LEN] = {};

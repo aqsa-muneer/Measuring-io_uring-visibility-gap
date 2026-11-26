@@ -14,9 +14,9 @@
 
 /* op codes — MUST match the strings the workload writes in ground_truth.csv */
 enum op_code {
-    OP_READ   = 0,
-    OP_WRITE  = 1,   /* overwrite (pwrite, or write to a non-append fd) */
-    OP_APPEND = 2,   /* write to a fd opened O_APPEND */
+    EVT_READ   = 0,
+    EVT_WRITE  = 1,   /* overwrite (pwrite, or write to a non-append fd) */
+    EVT_APPEND = 2,   /* write to a fd opened O_APPEND */
 };
 
 /* One emitted detection. Fixed-size so it rides the ring buffer cleanly. */

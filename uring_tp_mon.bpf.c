@@ -35,9 +35,9 @@ int on_submit(struct trace_event_raw_io_uring_submit_req *ctx) {
 
     int op;
     if (opcode == IORING_OP_READ || opcode == IORING_OP_READV)
-        op = OP_READ;
+        op = EVT_READ;
     else if (opcode == IORING_OP_WRITE || opcode == IORING_OP_WRITEV)
-        op = OP_WRITE;                 /* can't tell append from write at submit */
+        op = EVT_WRITE;                 /* can't tell append from write at submit */
     else
         return 0;                      /* openat/close/etc — not a scored op */
 

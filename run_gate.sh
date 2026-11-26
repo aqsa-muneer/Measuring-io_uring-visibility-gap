@@ -1,120 +1,110 @@
-set -euo pipefail
+#!/usr/bin/env bash
+# run_gate.sh — the DEFENSE experiment: the io_uring_setup gate.
+#
+# Part A (compatibility + visibility): four conditions, each with the syscall
+# monitor attached so we can see what the syscall layer catches. The workload
+# always ASKS for io_uring; what happens depends on the gate:
+#   no_gate           : io_uring works -> op evades the syscall monitor (the gap)
+#   enforce_blocked   : gate denies setup, no --fallback -> op blocked (nothing runs)
+#   enforce_fallback  : gate denies setup, --fallback    -> op retried as a syscall,
+#                       so the syscall monitor SEES it again (the gate's payoff)
+#   enforce_allowed   : workload is allowlisted -> io_uring works (trusted app
+#                       unaffected -> shows the policy doesn't break what it permits)
+# score_gate.py then reports via_ring / fallback / blocked / evaded per condition.
+#
+# Part B (cost): setup_bench times raw io_uring_setup() under three gate states
+# (none / allowlisted fast path / denied path). The gate runs once per ring, not
+# per I/O, so this isolates its true per-ring cost.
+#
+# NOTE: while the gate is loaded in --enforce mode it gates io_uring_setup
+# SYSTEM-WIDE, so non-allowlisted processes anywhere are denied for those few
+# seconds. Runs are short and the gate is torn down after each.
+set -u
 cd "$(dirname "$0")"
+sudo -v
+# keep sudo fresh; we only ever use targeted waits, never a bare `wait`
+( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
+KEEP=$!
+trap 'kill "$KEEP" 2>/dev/null; sudo pkill -9 -f "monitor syscall_mon" 2>/dev/null; sudo pkill -9 -f "[.]/gate " 2>/dev/null' EXIT
 
-OUT=/tmp/iouring-study/gate
-N_BENCH=${N_BENCH:-100000}
-mkdir -p "$OUT"
-rm -f "$OUT"/*.csv "$OUT"/*.log
+OUT=/tmp/iouring-study; G="$OUT/gate"; mkdir -p "$G"
+DECOY=/var/tmp/iouring-study/targets
+SELF="$(pwd)/workload"           # the binary we allowlist in the "allowed" cases
 
-[[ $EUID -eq 0 ]] || { echo "run with sudo"; exit 1; }
-for f in monitor syscall_mon.bpf.o gate gate.bpf.o workload setup_bench; do
-    [[ -e $f ]] || { echo "missing ./$f — build first (make; make -f Makefile.gate)"; exit 1; }
-done
-[[ -f setup_decoys.sh ]] && bash setup_decoys.sh >/dev/null
-
-HAVE_LSM=0; [[ -f lsm_mon.bpf.o ]] && HAVE_LSM=1
-
-# --- helpers -----------------------------------------------------------------
-# Monitors and the gate install their own SIGINT/SIGTERM handlers, so the
-# signals below reach them even though background jobs in a script ignore
-# SIGINT by default.
-start_mons() {   # $1 = run label
-    ./monitor syscall_mon.bpf.o syscall "$OUT/sys_$1.csv" >"$OUT/sysmon_$1.log" 2>&1 &
-    SYS_PID=$!
-    if (( HAVE_LSM )); then
-        ./monitor lsm_mon.bpf.o lsm "$OUT/lsm_$1.csv" >"$OUT/lsmmon_$1.log" 2>&1 &
-        LSM_PID=$!
-    fi
-    sleep 2
-}
-stop_mons() {
-    kill -INT "$SYS_PID"; wait "$SYS_PID" || true
-    if (( HAVE_LSM )); then kill -INT "$LSM_PID"; wait "$LSM_PID" || true; fi
-}
-start_gate() {   # args passed to ./gate; first arg = run label
-    local label=$1; shift
-    ./gate "$@" --csv "$OUT/gate_$label.csv" >"$OUT/gate_$label.log" 2>&1 &
-    GATE_PID=$!
-    sleep 2
-    kill -0 "$GATE_PID" 2>/dev/null || { echo "gate failed to start:"; cat "$OUT/gate_$label.log"; exit 1; }
-}
-stop_gate() { kill -TERM "$GATE_PID"; wait "$GATE_PID" || true; }
-
-run_workload() { # $1 = run label. Runs are spaced 1 s apart so the scorer's
-                 # time-window matching can't cross-match between them.
-    for m in uring sqpoll; do
-        ./workload --mode "$m" --fallback --gt "$OUT/gt_$1.csv"
-        sleep 1
-    done
-}
-
-# --- 1. no gate ---------------------------------------------------------------
-echo ">> run: nogate"
-start_mons nogate
-run_workload nogate
-stop_mons
-
-# --- 2. gate on, workload not allowlisted ------------------------------------
-echo ">> run: gate (enforce, empty allowlist)"
-start_gate gate --enforce
-start_mons gate
-run_workload gate
-stop_mons
-stop_gate
-
-# --- 3. gate on, workload allowlisted (the bypass) ----------------------------
-echo ">> run: allowed (enforce, ./workload allowlisted)"
-start_gate allowed --enforce --allow ./workload
-start_mons allowed
-run_workload allowed
-stop_mons
-stop_gate
-
-# --- 4. cost of the gate on io_uring_setup ------------------------------------
-# setup latency is noisy (~10 us per call, scheduler/cache effects), so each
-# condition is run REPEATS times, interleaved, and you report the median.
-REPEATS=${REPEATS:-5}
-echo ">> cost: io_uring_setup x $N_BENCH, $REPEATS repeats"
-COST="$OUT/setup_cost.csv"
-echo "condition,rep,n,ok,failed,first_errno,total_ns,ns_per_call" > "$COST"
-bench() { ./setup_bench "$N_BENCH" | tail -1 | sed "s/^/$1,$2,/" >> "$COST"; }
-
-for rep in $(seq 1 "$REPEATS"); do
-    bench no_gate "$rep"
-    start_gate bench_allowed --enforce --allow ./setup_bench
-    bench gate_allowed "$rep"   # allowed fast path: one hash-map lookup
-    stop_gate
-    start_gate bench_denied --enforce
-    bench gate_denied "$rep"    # deny path: lookup + ringbuf event + -EPERM
-    stop_gate
+[ -f "$DECOY/shadow.decoy" ] || { echo "decoys missing — creating"; ./setup_decoys.sh >/dev/null; }
+for b in workload monitor gate setup_bench syscall_mon.bpf.o gate.bpf.o; do
+  [ -e "$b" ] || { echo "missing $b — run 'make' first"; exit 1; }
 done
 
-# --- score -----------------------------------------------------------------------
+# ---- one compatibility/visibility condition -------------------------------
+# args: label  enforce(0/1)  allow_self(0/1)  wl_fallback(0/1)
+run_cond () {
+  local label=$1 enforce=$2 allow_self=$3 fb=$4
+  local GT="$G/${label}_gt.csv" MON="$G/${label}_mon.csv" GEV="$G/${label}_gate.csv"
+  sudo rm -f "$GT" "$MON" "$MON.ready" "$GEV"
+
+  # syscall monitor: measures what the syscall layer catches (incl. any fallback)
+  sudo timeout 60 ./monitor syscall_mon.bpf.o syscall "$MON" 2>/dev/null &
+  local mjob=$!
+  local i; for i in $(seq 1 80); do [ -f "$MON.ready" ] && break; sleep 0.25; done
+
+  # gate: load only when this condition uses enforce mode
+  local gjob=""
+  if [ "$enforce" = 1 ]; then
+    local allowarg=""; [ "$allow_self" = 1 ] && allowarg="--allow $SELF"
+    sudo ./gate --enforce $allowarg --csv "$GEV" 2>"$G/${label}_gate.log" &
+    gjob=$!
+    sleep 1.5                     # gate has no ready-file; give it time to attach
+  fi
+
+  # the workload always requests io_uring; --fallback decides blocked vs retried
+  local fbflag=""; [ "$fb" = 1 ] && fbflag="--fallback"
+  ./workload --mode uring $fbflag --gt "$GT" --targets "$DECOY" 2>"$G/${label}_wl.log"
+  sleep 1
+
+  sudo pkill -INT -f "monitor syscall_mon.bpf.o"
+  [ -n "$gjob" ] && sudo pkill -INT -f "[.]/gate "
+  wait "$mjob" 2>/dev/null
+  [ -n "$gjob" ] && wait "$gjob" 2>/dev/null
+
+  local wl; wl=$(tail -1 "$G/${label}_wl.log" 2>/dev/null)
+  echo "   [$label] $wl"
+}
+
+echo "################ PART A — gate compatibility & visibility ################"
+run_cond no_gate          0 0 0
+run_cond enforce_blocked  1 0 0
+run_cond enforce_fallback 1 0 1
+run_cond enforce_allowed  1 1 0
+
 echo
-echo "== syscall monitor =="
+echo ">> scoring (score_gate.py)"
 python3 score_gate.py \
-    --run nogate  "$OUT/gt_nogate.csv"  "$OUT/sys_nogate.csv" \
-    --run gate    "$OUT/gt_gate.csv"    "$OUT/sys_gate.csv" \
-    --run allowed "$OUT/gt_allowed.csv" "$OUT/sys_allowed.csv" \
-    --outdir "$OUT/out_syscall"
-if (( HAVE_LSM )); then
-    echo
-    echo "== lsm monitor (should stay ~1.00 recall in every run) =="
-    python3 score_gate.py \
-        --run nogate  "$OUT/gt_nogate.csv"  "$OUT/lsm_nogate.csv" \
-        --run gate    "$OUT/gt_gate.csv"    "$OUT/lsm_gate.csv" \
-        --run allowed "$OUT/gt_allowed.csv" "$OUT/lsm_allowed.csv" \
-        --outdir "$OUT/out_lsm"
-fi
+  --run no_gate          "$G/no_gate_gt.csv"          "$G/no_gate_mon.csv" \
+  --run enforce_blocked  "$G/enforce_blocked_gt.csv"  "$G/enforce_blocked_mon.csv" \
+  --run enforce_fallback "$G/enforce_fallback_gt.csv" "$G/enforce_fallback_mon.csv" \
+  --run enforce_allowed  "$G/enforce_allowed_gt.csv"  "$G/enforce_allowed_mon.csv" \
+  --outdir "$G/score"
+
 echo
-echo "== io_uring_setup cost (median ns per call) =="
-python3 - "$COST" <<'PY2'
-import csv, sys, statistics
-rows = list(csv.DictReader(open(sys.argv[1])))
-for cond in ("no_gate", "gate_allowed", "gate_denied"):
-    v = [float(r["ns_per_call"]) for r in rows if r["condition"] == cond]
-    print(f"  {cond:13s} median {statistics.median(v):9.1f} ns   (min {min(v):.1f}, max {max(v):.1f}, n={len(v)})")
-PY2
+echo "################ PART B — gate cost on io_uring_setup() ################"
+ITERS=${SETUP_ITERS:-100000}
+echo "n_per_call is nanoseconds per io_uring_setup()+close, ${ITERS} iters:"
+
+echo "--- baseline: no gate loaded ---"
+./setup_bench "$ITERS" | tail -1 | awk -F, '{printf "   no_gate        : %8.1f ns/call   (ok=%s failed=%s)\n",$6,$2,$3}'
+
+echo "--- gate enforce, setup_bench ALLOWLISTED (allowed fast path) ---"
+sudo ./gate --enforce --allow "$(pwd)/setup_bench" --csv "$G/cost_allowed_gate.csv" 2>"$G/cost_allowed.log" &
+gj=$!; sleep 1.5
+./setup_bench "$ITERS" | tail -1 | awk -F, '{printf "   gate_allowed   : %8.1f ns/call   (ok=%s failed=%s)\n",$6,$2,$3}'
+sudo pkill -INT -f "[.]/gate "; wait "$gj" 2>/dev/null
+
+echo "--- gate enforce, setup_bench NOT allowlisted (deny path) ---"
+sudo ./gate --enforce --csv "$G/cost_denied_gate.csv" 2>"$G/cost_denied.log" &
+gj=$!; sleep 1.5
+./setup_bench "$ITERS" | tail -1 | awk -F, '{printf "   gate_denied    : %8.1f ns/call   (ok=%s failed=%s)\n",$6,$2,$3}'
+sudo pkill -INT -f "[.]/gate "; wait "$gj" 2>/dev/null
+
 echo
-echo "gate decisions in the gate run (comm, verdict, exe):"
-tail -n +2 "$OUT/gate_gate.csv" | cut -d, -f4,5,8 | sort | uniq -c || true
+echo "gate decision logs + score in: $G/"

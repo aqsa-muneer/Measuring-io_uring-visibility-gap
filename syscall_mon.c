@@ -17,9 +17,9 @@ static volatile sig_atomic_t stop;
 static void on_sigint(int s) { (void)s; stop = 1; }
 
 static const char *op_str(int op) {
-    switch (op) { case OP_READ: return "read";
-                  case OP_WRITE: return "write";
-                  case OP_APPEND: return "append";
+    switch (op) { case EVT_READ: return "read";
+                  case EVT_WRITE: return "write";
+                  case EVT_APPEND: return "append";
                   default: return "?"; }
 }
 
